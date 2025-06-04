@@ -1,22 +1,15 @@
 import argparse
-import os
 from datetime import datetime
 from pathlib import Path
-from typing import List
 
-import av
-import numpy as np
 import torch
-import torchvision
 from diffusers import AutoencoderKL, DDIMScheduler
-from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
 from einops import repeat
 from omegaconf import OmegaConf
 from PIL import Image
 from torchvision import transforms
 from transformers import CLIPVisionModelWithProjection
 
-from configs.prompts.test_cases import TestCasesDict
 from src.models.pose_guider import PoseGuider
 from src.models.unet_2d_condition import UNet2DConditionModel
 from src.models.unet_3d import UNet3DConditionModel
@@ -41,6 +34,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     config = OmegaConf.load(args.config)
 
@@ -51,12 +45,12 @@ def main():
 
     vae = AutoencoderKL.from_pretrained(
         config.pretrained_vae_path,
-    ).to("cuda", dtype=weight_dtype)
+    ).to(device, dtype=weight_dtype)
 
     reference_unet = UNet2DConditionModel.from_pretrained(
         config.pretrained_base_model_path,
         subfolder="unet",
-    ).to(dtype=weight_dtype, device="cuda")
+    ).to(dtype=weight_dtype, device=device)
 
     inference_config_path = config.inference_config
     infer_config = OmegaConf.load(inference_config_path)
@@ -65,15 +59,15 @@ def main():
         config.motion_module_path,
         subfolder="unet",
         unet_additional_kwargs=infer_config.unet_additional_kwargs,
-    ).to(dtype=weight_dtype, device="cuda")
+    ).to(dtype=weight_dtype, device=device)
 
     pose_guider = PoseGuider(320, block_out_channels=(16, 32, 96, 256)).to(
-        dtype=weight_dtype, device="cuda"
+        dtype=weight_dtype, device=device
     )
 
     image_enc = CLIPVisionModelWithProjection.from_pretrained(
         config.image_encoder_path
-    ).to(dtype=weight_dtype, device="cuda")
+    ).to(dtype=weight_dtype, device=device)
 
     sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
     scheduler = DDIMScheduler(**sched_kwargs)
@@ -102,7 +96,7 @@ def main():
         pose_guider=pose_guider,
         scheduler=scheduler,
     )
-    pipe = pipe.to("cuda", dtype=weight_dtype)
+    pipe = pipe.to(device, dtype=weight_dtype)
 
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M")

@@ -1,55 +1,52 @@
 import argparse
-import os
-import random
 from datetime import datetime
 from pathlib import Path
-from typing import List
 
-import av
 import cv2
 import numpy as np
 import torch
 
 # 初始化模型
-import torchvision
 from diffusers import AutoencoderKL, DDIMScheduler
-from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
-from einops import rearrange, repeat
+from einops import repeat
 from omegaconf import OmegaConf
 from PIL import Image
 from torchvision import transforms
 from transformers import (
-    CLIPImageProcessor,
-    CLIPTextModel,
-    CLIPTokenizer,
-    CLIPVisionModel,
     CLIPVisionModelWithProjection,
 )
 
-import sys
 from src.models.unet_3d import UNet3DConditionModel
 from src.pipelines.pipeline_lmks2vid_long import Pose2VideoPipeline
 from src.models.pose_guider import PoseGuider
-from src.utils.util import get_fps, read_frames, save_videos_grid
+from src.utils.util import save_videos_grid
 from tools.facetracker_api import face_image
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", type=str, help="Path of inference configs",
-        default="./configs/prompts/inference_reenact.yaml"
+        "--config",
+        type=str,
+        help="Path of inference configs",
+        default="./configs/prompts/inference_reenact.yaml",
     )
     parser.add_argument(
-        "--save_dir", type=str, help="Path of save results",
-        default="./output/stage2_infer"
+        "--save_dir",
+        type=str,
+        help="Path of save results",
+        default="./output/stage2_infer",
     )
     parser.add_argument(
-        "--source_image_path", type=str, help="Path of source image", 
+        "--source_image_path",
+        type=str,
+        help="Path of source image",
         default="",
     )
     parser.add_argument(
-        "--driving_video_path", type=str, help="Path of driving video", 
+        "--driving_video_path",
+        type=str,
+        help="Path of driving video",
         default="",
     )
     parser.add_argument(
@@ -58,7 +55,7 @@ def parse_args():
         default=320,
         help="Checkpoint step of pretrained model",
     )
-    parser.add_argument("--mask_ratio", type=float, default=0.55)   # 0.55~0.6
+    parser.add_argument("--mask_ratio", type=float, default=0.55)  # 0.55~0.6
     parser.add_argument("-W", type=int, default=512)
     parser.add_argument("-H", type=int, default=512)
     parser.add_argument("-L", type=int, default=24)
@@ -106,7 +103,7 @@ def lmks_vis(img, lms):
 
 
 def batch_rearrange(pose_len, batch_size=24):
-    # To rearrange the pose sequence based on batch size 
+    # To rearrange the pose sequence based on batch size
     batch_ind_list = []
     for i in range(0, pose_len, batch_size):
         if i + batch_size < pose_len:
@@ -150,11 +147,12 @@ def adjust_pose(src_lms_list, src_size, ref_lms, ref_size):
         item[:, 1] = item[:, 1] - int((src_cy - ref_cy)) * src_size[0]
         new_src_lms_list.append(item)
     return np.array(new_src_lms_list)
-        
+
 
 def main():
     args = parse_args()
     infer_config = OmegaConf.load(args.config)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # base_model_path = "./pretrained_weights/huggingface-models/sd-image-variations-diffusers/"
     base_model_path = infer_config.pretrained_base_model_path
@@ -163,11 +161,11 @@ def main():
     image_enc = CLIPVisionModelWithProjection.from_pretrained(
         # "./pretrained_weights/huggingface-models/sd-image-variations-diffusers/image_encoder"
         infer_config.image_encoder_path
-    ).to(dtype=weight_dtype, device="cuda")
+    ).to(dtype=weight_dtype, device=device)
     vae = AutoencoderKL.from_pretrained(
         # "./pretrained_weights/huggingface-models/sd-vae-ft-mse"
         infer_config.pretrained_vae_path
-    ).to("cuda", dtype=weight_dtype)
+    ).to(device, dtype=weight_dtype)
     # initial reference unet, denoise unet, pose guider
     reference_unet = UNet3DConditionModel.from_pretrained_2d(
         base_model_path,
@@ -179,7 +177,7 @@ def main():
             "unet_use_temporal_attention": False,
             "mode": "write",
         },
-    ).to(device="cuda", dtype=weight_dtype)
+    ).to(device=device, dtype=weight_dtype)
     denoising_unet = UNet3DConditionModel.from_pretrained_2d(
         base_model_path,
         "./pretrained_weights/mm_sd_v15_v2.ckpt",
@@ -188,13 +186,13 @@ def main():
             infer_config.unet_additional_kwargs
         ),
         # mm_zero_proj_out=True,
-    ).to(device="cuda")
+    ).to(device=device)
     pose_guider1 = PoseGuider(
         conditioning_embedding_channels=320, block_out_channels=(16, 32, 96, 256)
-    ).to(device="cuda", dtype=weight_dtype)
+    ).to(device=device, dtype=weight_dtype)
     pose_guider2 = PoseGuider(
         conditioning_embedding_channels=320, block_out_channels=(16, 32, 96, 256)
-    ).to(device="cuda", dtype=weight_dtype)
+    ).to(device=device, dtype=weight_dtype)
     print("------------------initial all networks------------------")
     # load model from pretrained models
     denoising_unet.load_state_dict(
@@ -222,7 +220,9 @@ def main():
             map_location="cpu",
         )
     )
-    print("---------load pretrained denoising unet, reference unet and pose guider----------")
+    print(
+        "---------load pretrained denoising unet, reference unet and pose guider----------"
+    )
     # scheduler
     enable_zero_snr = True
     sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
@@ -242,13 +242,13 @@ def main():
         pose_guider2=pose_guider2,
         scheduler=scheduler,
     )
-    pipe = pipe.to("cuda", dtype=weight_dtype)
+    pipe = pipe.to(device, dtype=weight_dtype)
     height, width, clip_length = args.H, args.W, args.L
     generator = torch.manual_seed(42)
     date_str = datetime.now().strftime("%Y%m%d")
     save_dir = Path(f"{args.save_dir}/{date_str}")
     save_dir.mkdir(exist_ok=True, parents=True)
-    
+
     ref_image_path, pose_video_path = args.source_image_path, args.driving_video_path
     ref_name = Path(ref_image_path).stem
     pose_name = Path(pose_video_path).stem
@@ -281,7 +281,7 @@ def main():
             pose_image, pose_mouth_image, _ = lmks_vis(zero_map, pose_lms)
             h, w, c = pose_image.shape
             pose_up_image = pose_image.copy()
-            pose_up_image[int(h * args.mask_ratio):, :, :] = 0.
+            pose_up_image[int(h * args.mask_ratio) :, :, :] = 0.0
             pose_image_pil = Image.fromarray(pose_image)
             pose_frame = Image.fromarray(pose_frame)
             pose_up_pil = Image.fromarray(pose_up_image)
@@ -330,7 +330,8 @@ def main():
     )
     print("infer results: {}".format(save_video_path))
     del pipe
-    torch.cuda.empty_cache()
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
